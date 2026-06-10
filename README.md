@@ -1,92 +1,63 @@
 # ternary-priority-queue
 
-Priority queue for GPU kernel scheduling with ternary scoring. Items scored {-1=deprioritize, 0=normal, +1=prioritize}. O(1) ternary classify, O(log n) exact ordering.
+Priority queue for GPU kernel scheduling with ternary scoring — high (+1), normal (0), low (-1).
 
-## Why This Matters
+## Why This Exists
 
-# ternary-priority-queue
-Priority queue for GPU kernel scheduling with ternary scoring.
+GPU kernels have different urgency levels. A real-time inference kernel is high priority. A background batch job is low priority. A maintenance kernel (defragmentation, checkpoint) is normal. This crate wraps a binary heap with ternary classification: every job gets an exact priority number for ordering, plus a ternary score (-1, 0, +1) for fast categorization. You can drain all high-priority kernels first, check the distribution of priorities, and schedule accordingly.
 
-## The Five-Layer Stack
+## Architecture
 
-This crate is part of the **Oxide Stack** — a distributed GPU runtime built on five layers:
+### Core Types
 
-```
-┌─────────────────┐
-│  cudaclaw        │  Persistent GPU kernels, warp consensus, SmartCRDT
-├─────────────────┤
-│  cuda-oxide      │  Flux → MIR → Pliron → NVVM → PTX compiler
-├─────────────────┤
-│  flux-core       │  Bytecode VM + A2A agent protocol
-├─────────────────┤
-│  pincher         │  "Vector DB as runtime, LLM as compiler"
-├─────────────────┤
-│  open-parallel   │  Async runtime (tokio fork)
-└─────────────────┘
-```
+- **`KernelJob`** — A scheduled job with `id`, `name`, `exact_priority` (fine-grained), `ternary_score` (-1/0/+1), and `enqueue_time_us`.
+- **`TernaryPriorityQueue`** — Binary heap wrapper tracking counts per priority tier.
 
-The key insight: **ternary values {-1, 0, +1} map directly to GPU compute**. They pack 16× denser than FP32, enable XNOR+popcount matmul, and conservation laws become compile-time checks.
+### Priority Logic
 
-## Design
-
-Every value in this crate follows **ternary algebra** (Z₃):
-
-| Value | Meaning | GPU Analog |
-|-------|---------|------------|
-| +1 | Positive / Active / Healthy | Warp vote yes |
-| 0 | Neutral / Pending / Balanced | Warp vote abstain |
-| -1 | Negative / Failed / Overloaded | Warp vote no |
-
-This isn't arbitrary — ternary is the natural encoding for:
-1. **BitNet b1.58** (Microsoft) — ternary LLMs at 60% less power
-2. **GPU warp voting** — hardware ballot returns ternary consensus
-3. **Conservation laws** — {-1, 0, +1} preserves quantity
-
-## Key Types
-
-```rust
-pub struct KernelJob
-pub struct TernaryPriorityQueue
-pub fn new
-pub fn push
-pub fn push_with_score
-pub fn pop
-pub fn peek
-pub fn drain_high_priority
-pub fn len
-pub fn is_empty
-pub fn high_count
-pub fn normal_count
-```
+- `push(name, exact)`: Auto-assigns ternary score based on exact priority thresholds.
+- `push_with_score(name, exact, score)`: Manual ternary score override.
+- `drain_high_priority`: Extract all +1 jobs for immediate dispatch.
 
 ## Usage
 
-```toml
-[dependencies]
-ternary-priority-queue = "0.1.0"
-```
-
 ```rust
-use ternary_priority_queue::*;
-// See src/lib.rs tests for complete working examples
+use ternary_priority_queue::TernaryPriorityQueue;
+
+let mut pq = TernaryPriorityQueue::new();
+
+pq.push("realtime_inference", 100);  // high priority
+pq.push("batch_training", 10);       // low priority
+pq.push("checkpoint", 50);           // normal
+pq.push_with_score("emergency", 200, 1); // force high
+
+// Drain all critical work first
+let critical = pq.drain_high_priority();
+assert_eq!(critical.len(), 2);
+
+// Pop next highest
+let next = pq.pop();
 ```
 
-## Testing
+## API Reference
 
-```bash
-git clone https://github.com/SuperInstance/ternary-priority-queue.git
-cd ternary-priority-queue
-cargo test    # 7 tests
-```
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `new()` | `TernaryPriorityQueue` | Create empty queue |
+| `push(name, exact_priority)` | `u64` | Enqueue with auto ternary score |
+| `push_with_score(name, exact, score)` | `u64` | Enqueue with manual ternary score |
+| `pop()` | `Option<KernelJob>` | Dequeue highest priority |
+| `peek()` | `Option<&KernelJob>` | Look at top without removing |
+| `drain_high_priority()` | `Vec<KernelJob>` | Extract all +1 jobs |
+| `len()` / `is_empty()` | `usize` / `bool` | Queue size |
+| `high_count()` / `normal_count()` / `low_count()` | `u64` | Per-tier counts |
 
-## Stats
+## The Deeper Idea
 
-| Metric | Value |
-|--------|-------|
-| Tests | 7 |
-| Lines of Rust | 152 |
-| Public API | 13 items |
+Ternary priority is a **two-level scheduling signal**. The exact priority gives fine-grained ordering within a tier. The ternary score gives coarse-grained routing: high-priority jobs go to the fast lane (dedicated GPU stream), normal go to the shared stream, and low-priority jobs get whatever's left. This avoids the complexity of a full priority scheduler while giving you the most important scheduling decision (fast lane vs. slow lane) essentially for free.
 
-## License
+## Related Crates
 
-Apache-2.0
+- **ternary-semaphore** — resource permits with ternary capacity
+- **ternary-dispatch** — kernel dispatch with ternary-packed payloads
+- **ternary-backpressure** — backpressure for pipeline stages
